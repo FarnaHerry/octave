@@ -43,12 +43,17 @@ mcpp build --release  # release
 | 模块 | 职责 |
 | --- | --- |
 | `src/app.cpp` | 配置、常驻壳（工具栏/状态栏/页面分发）、全局按键、启动引擎 |
-| `src/octave_engine.cppm` | octave 子进程（fork+双管道）、哨兵分块协议、读线程事件信箱 |
+| `src/octave_engine.cppm` | octave 子进程（forkpty 交互式 PTY）、哨兵分块协议、读线程事件信箱 |
 | `src/store.cppm` | 会话状态：控制台行、历史、工作区、视图位置（仅 UI 线程读写） |
 | `src/ui/*.cppm` | 页面渲染与设计令牌；后台回调只 enqueue + `requestUiUpdate()`，UI 在 `compose()` 排空 |
 
-协议：每条命令追加 `disp('<sentinel>')`，读线程按行匹配哨兵判定块结束——
-stdin 有序 ⇒ 哨兵按序返回，天然支持命令排队。工作区用 `ECTVAR|name|class|dims`
+协议：octave 跑在 `forkpty` 造出的真 PTY 里——管道模式会进入批处理语义，
+任何 `error()` 或语法错误直接终止解释器（Octave 10 移除了
+`set_error_handler`，try/catch 罩不住 parse error），而 REPL 的日常就是打错
+命令；PTY 里报错回到提示符，中断 = 写一个 `0x03`（Ctrl+C）。每条命令追加
+`disp('%<sentinel>%')`，读线程按行精确匹配哨兵判定块结束——stdin 有序 ⇒
+哨兵按序返回，天然支持命令排队。回显行按引导里设死的 `PS1 = "ec> "` 前缀
+整行丢弃（控制台回显由 UI 自己渲染）。工作区用 `ECTVAR|name|class|dims`
 前缀行回传，不进控制台。
 
 ## 已知边界
@@ -56,5 +61,5 @@ stdin 有序 ⇒ 哨兵按序返回，天然支持命令排队。工作区用 `E
 - 图形：`--no-window-system` 下 `plot()` 不开窗口（需要图时用
   `print('/tmp/f.png','-dpng')` 再自行查看）；GUI 内嵌绘图是后续方向。
 - 中断依赖 octave 对 SIGINT 的处理，极端情况下可能需要「重启」清会话。
-- 未做 Windows/macOS 分支（引擎是 POSIX fork/pipe 实现）。
+- 未做 Windows/macOS 分支（引擎是 POSIX forkpty 实现）。
 - 无 `mcpp test` 目标：`app-main` 已提供 `main()`，与测试二进制冲突（同 tinynext）。
