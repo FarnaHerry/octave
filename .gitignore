@@ -2,3 +2,7 @@ target/
 .mcpp/
 compile_commands.json
 engines/
+octave-workspace
+dist/
+ectave-v*.tar.gz
+ectave-v*.zip

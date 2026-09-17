@@ -204,9 +204,13 @@ inline void syncFromEngine(OctaveEngine& engine) {
         case EventKind::StartFailed:
             appendLine(LineKind::Error,
                        event.failReason == "not-found"
-                           ? "ectave: 既无内置引擎（engines/octave）也没在 PATH 找到 octave — "
-                             "运行 scripts/build_engines.sh 打包内置，或 sudo dnf install octave，"
-                             "然后点「重启」"
+                           ? "ectave: 没找到 Octave — 既没有内置引擎（engines/octave），PATH 上"
+                             "也没有 octave-cli/octave。先装一个（Windows/macOS 用官网安装包，"
+                             "Linux 用包管理器），再点「重启」；Linux 上也可用 "
+                             "scripts/build_engines.sh 打包出自包含引擎"
+                       : event.failReason == "conpty-unavailable"
+                           ? "ectave: 本机不支持 ConPTY（需要 Windows 10 1809 及以上），"
+                             "无法启动交互会话"
                            : "ectave: Octave 启动失败（" + event.failReason + "）");
             break;
         case EventKind::Exited:

@@ -1,0 +1,240 @@
+# release.yml — 在 Windows / Linux / macOS 上构建 ectave，并在 `v*` tag 上创建
+# GitHub Release（draft，人工点发布）。
+#
+#   * mcpp：Linux/macOS 走官方一行安装脚本（→ ~/.mcpp）；Windows 走 xlings/subos
+#     并钉住与本地开发一致的版本。
+#   * 不打内置 Octave 引擎：engines/octave 由 scripts/build_engines.sh 在**有
+#     octave 的 Linux 机器**上生成（ldd 依赖闭包 + OCTAVE_HOME 资源树，约 250MB），
+#     CI 上没有 octave，也不该把它塞进每个 artifact。发行包因此走引擎查找顺序的
+#     第二档——「PATH 上的 octave」，包内 README 写明了怎么装、怎么自行内置。
+#   * 打包：Linux → tar.gz（含 run.sh：经系统 ld.so 加载，图形栈走系统 Mesa）、
+#     macOS → tar.gz、Windows → zip。三个包结构一致：ectave[.exe] + assets/ + README.md。
+#
+# NOTE: 本地开发在 Linux；Windows / macOS 两个 job 由 CI 自身验证（首次发布：
+# 编译通过即产物可下载，运行期尚未在真机验证——见 Release 说明）。
+#
+# 不打 tag 时也可以手动触发（workflow_dispatch）：只构建并上传 artifact，不建 Release。
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win64
+            os: windows-latest
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mcpp (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://github.com/mcpp-community/mcpp/releases/latest/download/install.sh | bash
+          echo "$HOME/.mcpp/bin" >> "$GITHUB_PATH"
+
+      - name: Install mcpp (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 官方 install.sh 只覆盖 linux/mac，Windows 走 xlings/subos。
+          irm https://d2learn.org/xlings-install.ps1.txt | iex
+          # 当前进程的 PATH 不会自动刷新，用全路径调用 xlings。先刷包索引，再钉住
+          # 与本地开发一致的 mcpp 版本（索引滞后时默认解析可能装到旧版）。
+          & "$env:USERPROFILE\.xlings\bin\xlings.exe" update
+          & "$env:USERPROFILE\.xlings\bin\xlings.exe" install mcpp@2026.9.17.2 -y
+          # mcpp 装到 subos/default/bin；写入 GITHUB_PATH 供后续步骤使用。
+          "$env:USERPROFILE\.xlings\subos\default\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache mcpp toolchain
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.os == 'Windows' && '~/.xlings' || '~/.mcpp' }}
+          key: mcpp-${{ runner.os }}-${{ hashFiles('mcpp.lock', 'mcpp.toml') }}
+
+      - name: Refresh package index (defensive)
+        shell: bash
+        run: |
+          # mcpp/xlings 的包索引可能滞后（曾因索引缺 eui-neo 某版本导致拉包失败）。
+          # 刷新失败不致命——本地已有完整索引时 mcpp build 仍能继续。
+          if command -v xlings >/dev/null 2>&1; then
+            xlings update || echo "xlings update failed — continuing with existing index"
+          else
+            echo "xlings not found — skipping index refresh"
+          fi
+
+      - name: Patch glib recipe (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # xim-pkgindex 的 glib 配方曾无条件声明 programs = {...15 个工具}（为
+          # 2.88.3 的完整 bin/ 而加），但 eui-neo 钉的 2.80.0 是裁剪版、没有 bin/，
+          # xlings 安装后校验「声明的 programs 一个都没注册」直接 E_INTERNAL。
+          # eui-neo 的 compat 配方走的是 xlings 包图，因此要先把这行删掉。
+          # 上游修复后本步骤自动变成空操作（找不到该行不再报错）。
+          mcpp index status >/dev/null  # 首次索引相关调用触发 registry 种子化
+          GLIB_LUA="$HOME/.mcpp/registry/data/xim-pkgindex/pkgs/g/glib.lua"
+          if [ ! -f "$GLIB_LUA" ]; then
+            echo "glib.lua not found at $GLIB_LUA — skipping (index layout may have changed)"
+          elif grep -q '^    programs = ' "$GLIB_LUA"; then
+            sed -i '/^    programs = /d' "$GLIB_LUA"
+            echo "patched $GLIB_LUA (dropped unconditional programs declaration)"
+          else
+            echo "glib.lua already clean — nothing to patch"
+          fi
+
+      - name: Build release
+        run: mcpp build --release
+
+      - name: Stage compiled exe
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只取最新一个 target/<triple>/<hash>/bin，避免遍历易错的多 hash 目录。
+          bin="$(ls -dt target/*/*/bin | head -1)"
+          src="$(find "$bin" -maxdepth 1 -name 'ectave*' -type f | head -1)"
+          [ -n "$src" ] || { echo "compiled binary not found in $bin" >&2; exit 1; }
+          mkdir -p dist-src
+          # 保留平台扩展名：Windows 拷贝为 ectave.exe，unix 拷贝为 ectave。
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$src" dist-src/ectave.exe
+          else
+            cp "$src" dist-src/ectave
+          fi
+          ls -lh dist-src/
+
+      - name: Upload compiled exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.name }}
+          path: dist-src/
+          if-no-files-found: error
+
+  package:
+    name: package-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win64
+            os: windows-latest
+            os_id: win
+            arch: win64
+            pkg_glob: ectave-v*.zip
+          - name: linux-x64
+            os: ubuntu-latest
+            os_id: linux
+            arch: x86_64
+            pkg_glob: ectave-v*.tar.gz
+          - name: macos-arm64
+            os: macos-latest
+            os_id: macos
+            arch: arm64
+            pkg_glob: ectave-v*.tar.gz
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download compiled exe
+        uses: actions/download-artifact@v8
+        with:
+          name: build-${{ matrix.name }}
+          path: dist-src
+
+      - name: Package tar.gz (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash packaging/ci-package.sh "${{ matrix.os_id }}" "${{ matrix.arch }}" dist-src/ectave
+
+      - name: Package zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "packaging/ci-package.ps1" -Exe "dist-src/ectave.exe"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          # pkg- 前缀：release job 只下载安装包，不会混进 build-* 的裸二进制。
+          name: pkg-${{ matrix.name }}
+          path: ${{ matrix.pkg_glob }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download installers
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: 'pkg-*'
+          merge-multiple: true
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ectave ${{ github.ref_name }}
+          # draft：tag 推送后先建草稿，人工过一眼产物再点发布。
+          draft: true
+          body: |
+            ## ectave ${{ github.ref_name }}
+
+            EUI-NEO 套壳 GNU Octave CLI 的桌面工作台。三个平台都是免安装压缩包，
+            解压后在目录里启动即可（`assets/` 是随包字体，按相对路径读取）。
+
+            | 平台 | 包 | 启动 |
+            | --- | --- | --- |
+            | Linux x86_64 | `ectave-v*-linux-x86_64.tar.gz` | `./run.sh` |
+            | macOS Apple Silicon | `ectave-v*-macos-arm64.tar.gz` | `./ectave` |
+            | Windows x64 | `ectave-v*-win64.zip` | `ectave.exe` |
+
+            **需要自备 Octave 解释器**：本包不含 Octave，启动时按
+            `engines/octave/`（内置引擎）→ `PATH` 上的 `octave-cli` → `octave`
+            的顺序查找。装上 Octave 即可：
+
+            - Windows：<https://octave.org/download>（安装时勾选 Add to PATH）
+            - macOS：`brew install octave`
+            - Linux：`sudo dnf install octave` / `sudo apt install octave`
+
+            想做成自包含（不依赖系统 Octave）：在已装 Octave 的 Linux 机器上从
+            源码跑 `sh scripts/build_engines.sh` 生成 `engines/octave/`（约
+            250MB），放到程序同级目录即可——引擎会被优先使用。
+
+            **已知边界**：`plot()` 不开窗口（引擎跑在 `--no-window-system` 下，
+            需要图时用 `print('/tmp/f.png','-dpng')`）；中断靠往终端写 Ctrl+C
+            实现，极端情况用「重启」清会话；内置引擎树是 Linux 打包脚本的产物，
+            Windows/macOS 请用系统 Octave。Linux 包需要 glibc ≥ 2.39 的桌面环境。
+
+            **首次发布说明**：Windows / macOS 两个版本由 CI 交叉验证到「编译并打包
+            成功」，尚未在真机跑过运行期用例（Linux 侧已本地验证，含内置引擎）。
+            遇到问题请提 issue 附平台与 Octave 版本。
+          files: artifacts/*

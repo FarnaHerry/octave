@@ -16,9 +16,12 @@ mcpp + C++23 模块构建（与 tinynext 同一工程模式：`app-main` feature
 - **工作区面板**：命令执行完自动快照 `who + class + size`，单击变量直接执行
   `disp('name')` 查看内容。
 - **脚本页**：多行编辑区整段一次发给 Octave，F5 / 「运行脚本」执行。
-- **会话控制**：状态灯 + 版本、中断（SIGINT）、重启、清屏、工作区开关；
+- **会话控制**：状态灯 + 版本、中断（Ctrl+C）、重启、清屏、工作区开关；
   优先使用内置引擎（`engines/octave/`），没有内置时回落 PATH 上的 octave，
   都没有时给友好提示并支持一键重启。
+- **三平台**：Linux/macOS 用 `forkpty` 真 PTY，Windows 用 ConPTY
+  （`CreatePseudoConsole`，需 Win10 1809+）——同一个「让 octave 认为是真人
+  终端」的东西，协议与线程模型两平台完全共用。
 
 快捷键：`Ctrl+L` 清屏 · `Ctrl+1/2` 切页 · `F5` 运行脚本。
 
@@ -35,8 +38,9 @@ mcpp + C++23 模块构建（与 tinynext 同一工程模式：`app-main` feature
     FLEXIBLAS_CONFIG)` 后绝对路径 `execv`，无需经 launcher.sh（那只是手动调试入口）。
     在打包机上运行脚本即可（按 `__octave_config_info__` 自适应 lib/lib64 布局；
     换 Debian multiarch 打包需核对 home 树布局）。
-  - **系统**：装 `sudo dnf install octave`（或 apt）后直接可用，PATH 上的
-    `octave-cli` → `octave`。
+  - **系统**：装 `sudo dnf install octave`（或 apt / brew / Windows 官网安装包）
+    后直接可用，PATH 上的 `octave-cli` → `octave`（Windows 侧按 PATHEXT 试
+    `.exe` 等后缀）。内置引擎树是 Linux 打包脚本的产物，Windows 走这一档。
   - `ECTAVE_OCTAVE_HOME=<dir>` 可显式指定内置引擎根（目录须含
     `bin/octave-cli`）。exe 经 `run.sh` 的系统 ld.so 加载时 `/proc/self/exe`
     指向 loader，因此查找同时参考 `/proc/self/cmdline[0]` 与 cwd 逐级上溯。
@@ -53,15 +57,40 @@ sh scripts/build_engines.sh   # 可选：把本机 octave 打包成内置引擎 
 `run.sh` 经系统 `ld.so` 加载（原因同 tinynext：mcpp 私有 glibc 与本机 Mesa/GLX
 的 GLIBC 版本不匹配），并注入 `INTEL_FORCE_PROBE=1`（本机 Arc 显卡需要）。
 
+## 发布（GitHub Actions）
+
+`.github/workflows/release.yml`：推 `v*` tag 时在 Windows / Linux / macOS 三平台
+各构建一次，打包成免安装压缩包并创建 **draft** Release（人工点发布）；
+`workflow_dispatch` 可手动跑一遍只出 artifact。
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0   # 触发
+```
+
+- 包结构三平台一致：`ectave[.exe]` + `assets/` + `README.md`（用户向说明，
+  源在 `packaging/dist-README.md`）；Linux 额外带 `run.sh`。
+- **不打内置 Octave 引擎**：`engines/octave` 是在有 octave 的 Linux 机器上用
+  `scripts/build_engines.sh` 生成的（约 250MB），CI 上既没有 octave 也不该把
+  它塞进每个 artifact，因此发行包走「PATH 上的 octave」这一档；本地手动打包时
+  若 `engines/octave` 已存在，`packaging/ci-package.sh` 会自动一并带上。
+- Windows/macOS 的 mcpp 来自 xlings（官方 `install.sh` 只覆盖 linux/mac）；
+  Windows 侧钉住与本地一致的 mcpp 版本。
+- Linux 包的 `run.sh` 用 `--inhibit-rpath ''` 清掉产物里的 RPATH——那里面是构建
+  机的 mcpp xpkg 绝对路径（含私有 glibc），RPATH 优先级高于 `--library-path`，
+  不清就会在装过 mcpp 的机器上出现 `__pointer_chk_guard ... GLIBC_PRIVATE`
+  这种私有 glibc 与系统库混用的崩法。
+
 ## 架构
 
 | 模块 | 职责 |
 | --- | --- |
 | `src/app.cpp` | 配置、常驻壳（工具栏/状态栏/页面分发）、全局按键、启动引擎 |
-| `src/octave_engine.cppm` | octave 子进程（forkpty 交互式 PTY）、内置引擎查找与环境装配、哨兵分块协议、读线程事件信箱 |
+| `src/octave_engine.cppm` | octave 子进程（POSIX `forkpty` / Windows `ConPTY` 双实现，协议与读线程共用）、内置引擎查找与环境装配、哨兵分块协议、事件信箱 |
 | `src/store.cppm` | 会话状态：控制台行、历史、工作区、视图位置（仅 UI 线程读写） |
 | `src/ui/*.cppm` | 页面渲染与设计令牌；后台回调只 enqueue + `requestUiUpdate()`，UI 在 `compose()` 排空 |
 | `scripts/build_engines.sh` | 内置引擎打包：ldd 闭包平铺（剔除 glibc/图形栈）+ share/lib64 资源树 + flexiblas provider 与 rc |
+| `packaging/ci-package.{sh,ps1}` | 发布打包（不编译）：exe + assets + 用户向 README → tar.gz / zip |
+| `.github/workflows/release.yml` | 三平台构建 → 打包 → tag 上建 draft Release |
 
 协议：octave 跑在 `forkpty` 造出的真 PTY 里——管道模式会进入批处理语义，
 任何 `error()` 或语法错误直接终止解释器（Octave 10 移除了
@@ -77,7 +106,10 @@ sh scripts/build_engines.sh   # 可选：把本机 octave 打包成内置引擎 
 - 图形：`--no-window-system` 下 `plot()` 不开窗口（需要图时用
   `print('/tmp/f.png','-dpng')` 再自行查看）；GUI 内嵌绘图是后续方向。
 - 中断依赖 octave 对 SIGINT 的处理，极端情况下可能需要「重启」清会话。
-- 未做 Windows/macOS 分支（引擎是 POSIX forkpty 实现）。
+- Windows/macOS 分支已实现（ConPTY / `forkpty`，`cfg(windows)`+`cfg(macos)` 的
+  链接开关在 `mcpp.toml`），但两侧只在 CI 里验证到「编译 + 打包」——运行期尚未
+  在真机跑过（Linux 侧含内置引擎已端到端验证）。Windows 需要 Win10 1809+（低于
+  此版本会报 conpty-unavailable 而不崩）。
 - 内置引擎依赖目标机的 glibc 与图形/窗口栈（ectave 本体同样需要，故不算额外
   负担）；打包脚本须在有 octave 的机器上运行，脚本硬用 `/usr/bin/ldd` 以免被
   PATH 上其他发行环境的同名 ldd 遮蔽（xlings subos 的坑，openxlings/xlings#608）。

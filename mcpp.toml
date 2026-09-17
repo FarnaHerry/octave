@@ -23,3 +23,14 @@ bmi_schedule = "on"
 # 运行方式与 tinynext 相同（run.sh 用系统 ld.so 加载系统 Mesa，见 run.sh 注释）。
 [dependencies.compat]
 eui-neo = { version = "0.5.9", features = ["app-main"] }
+
+# Windows：GUI 子系统（启动不弹控制台黑窗）。/entry:mainCRTStartup 保持调用
+# main()——GUI 子系统的默认入口 WinMainCRTStartup 会找不到 WinMain，而 main()
+# 由 eui-neo 的 app-main（glfw_app_main.cpp）提供。ConPTY 的三个入口是运行期
+# 从 kernel32 取的，不需要额外的导入库。
+[target.'cfg(windows)'.build]
+ldflags = ["-Wl,-subsystem:windows", "-Wl,-entry:mainCRTStartup"]
+
+# macOS：forkpty 在 libutil 里（Linux 上它在 libc 内，无需额外 -l）。
+[target.'cfg(macos)'.build]
+ldflags = ["-lutil"]
