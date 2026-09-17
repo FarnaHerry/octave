@@ -1,0 +1,25 @@
+[package]
+name        = "ectave"
+version     = "0.1.0"
+description = "EUI-NEO workbench wrapping the GNU Octave CLI"
+license     = "Apache-2.0"
+
+# src/main.cpp 不存在：`app-main` feature 的 glfw_app_main.cpp 提供 main()，
+# mcpp 无法自动推断 bin target，所以显式声明。app.cpp 提供
+# app::dslAppConfig() + app::compose()，src/ 其余模块经默认 glob 参与编译。
+[targets.ectave]
+kind = "bin"
+main = "src/app.cpp"
+
+# 与本机 tinynext/apitab 同一工具链，产物可复现。
+[toolchain]
+default = "llvm@22.1.8"
+
+# 并行预编译模块接口（本项目几乎全 C++23 模块，收益明显）。
+[build]
+bmi_schedule = "on"
+
+# eui-neo 0.5.9：app-main feature 提供 GLFW 入口；Linux 走 X11/OpenGL，
+# 运行方式与 tinynext 相同（run.sh 用系统 ld.so 加载系统 Mesa，见 run.sh 注释）。
+[dependencies.compat]
+eui-neo = { version = "0.5.9", features = ["app-main"] }
