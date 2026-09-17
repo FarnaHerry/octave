@@ -14,7 +14,12 @@ import ectave.ui.utils;
 import ectave.ui.theme;
 import ectave.ui.command_input;
 
-namespace ectave::ui { namespace {   // 模块内部实现（匿名空间不能放进 export namespace）
+// 模块内部实现：写在 ectave::ui 里但**不 export** —— 这些实体因此是模块链接性，
+// 本模块之外看不见，达到了「内部实现」的原意。
+// 别改回匿名命名空间：内部链接的类型（DisplayRow）会经导出函数的 lambda 与
+// std::vector<DisplayRow> 的实例化漏出去，GCC 按 [basic.link]/14 报
+// "暴露了 TU 局部实体"（clang 不报，但标准上确实是病式）。
+namespace ectave::ui {
 
 struct DisplayRow {
     LineKind kind{LineKind::Output};
@@ -54,7 +59,6 @@ void rebuildRows(float availWidth) {
     s_wrapWidth = availWidth;
 }
 
-} // anonymous
 } // namespace ectave::ui
 
 export namespace ectave::ui {

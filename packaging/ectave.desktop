@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ectave
+Name[zh_CN]=ectave Octave 工作台
+Comment=GNU Octave workbench (EUI-NEO shell over the octave CLI)
+Comment[zh_CN]=EUI-NEO 套壳 GNU Octave CLI 的桌面工作台
+Exec=ectave
+Icon=ectave
+Terminal=false
+Categories=Development;Science;Math;Education;
+Keywords=octave;matlab;math;numerical;plot;

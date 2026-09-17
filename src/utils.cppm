@@ -50,7 +50,7 @@ inline std::size_t utf8Next(const std::string& s, std::size_t pos) {
     int seq = 1;
     if ((c & 0x80) == 0) seq = 1;
     else if ((c & 0xE0) == 0xC0) seq = 2;
-    else if ((c & 0xF0) == 0xF0) seq = 3;
+    else if ((c & 0xF0) == 0xE0) seq = 3;
     else if ((c & 0xF8) == 0xF0) seq = 4;
     return std::min(s.size(), pos + static_cast<std::size_t>(seq));
 }

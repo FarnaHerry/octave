@@ -9,12 +9,15 @@
 
 | 平台 | 怎么启动 |
 | --- | --- |
-| Linux x86_64 | `./run.sh`（内含系统 ld.so 加载脚本，见下） |
+| Linux x86_64（tar.gz） | `./run.sh` |
+| Linux x86_64（.deb/.rpm） | 装完直接运行 `ectave`（应用菜单里也能找到） |
 | macOS arm64 | `./ectave` |
 | Windows x64 | 双击 `ectave.exe`（或命令行运行） |
 
-`assets/` 里是随包的字体（JetBrains Mono / Noto Sans SC / Font Awesome），
-请**在解压出的目录里启动**，程序按相对路径读字体。
+`assets/` 里是随包的字体（JetBrains Mono / Noto Sans SC / Font Awesome）。
+在解压出的目录里启动最省事；就算在别处启动也没关系——程序按
+「当前目录 → 可执行文件旁边的 assets/」的顺序找字体，压缩包解压后这两者是同一个
+目录。
 
 ## 还需要一个 Octave
 
@@ -46,15 +49,16 @@ sh scripts/build_engines.sh      # 生成 engines/octave/（约 250MB）
 `OCTAVE_HOME` 树；剔除 glibc 与图形/窗口栈（运行 ectave 的机器本来就有，
 打包反而会和发行版的 Mesa 驱动打架）。
 
-## 已知边界（v0.1.0）
+## 已知边界
 
 - `plot()` 不开窗口（引擎以 `--no-window-system` 启动）；需要图时用
   `print('/tmp/f.png','-dpng')` 再自行查看。
 - 中断靠往终端写 `0x03`（Ctrl+C）实现，极端情况下可能需要「重启」清会话。
 - 内置引擎树是 Linux 的打包脚本产物；Windows/macOS 请用系统 Octave。
-- Linux 包里的 `run.sh` 绕了一层系统 `ld.so`：mcpp 自带的 glibc 与发行版
-  图形栈（Mesa/GLX）的 GLIBC 版本可能对不上，用系统加载器起更稳。
-  需要 glibc ≥ 2.39 的桌面环境。
+- Linux 压缩包里的 `lib/` 是 clang 的 C++ 运行时（libc++ / libc++abi /
+  libunwind，多数发行版不预装），可执行文件通过 `$ORIGIN/lib` 的 RUNPATH 加载，
+  整个目录一起搬走即可，别只拷可执行文件。系统侧只需要常规的 glibc 与
+  图形栈（Mesa/GLX）。
 
 ## 许可
 

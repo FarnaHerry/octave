@@ -1,0 +1,397 @@
+# build.yml — ectave 多平台 CI 矩阵（Linux / Windows / macOS）+ tag release。
+#
+# 形态蓝本：姊妹项目 llm-switch / Clash-Flux 的 .github/workflows/build.yml（已跑通的
+# 「C++23 modules + import std」三平台解法），按本仓库适配：
+#   * 目标名 ectave，UI 依赖是 EUI-NEO（源码通道，不是预编译 SDK）。
+#   * EUI-NEO 走源码：每个 job 自己 clone 到 third_party/eui-neo 并钉 env.EUI_NEO_COMMIT，
+#     与本地开发形态一致（本地也是 third_party/eui-neo）。EUI 把 glfw/freetype/libpng/
+#     zlib/yyjson/tray/md4c 都 vendored 在自己 3rd/ 下，所以 CI 不需要装 glfw/glew。
+#   * 工具链沿用 Clash-Flux 实证配方：Linux=ubuntu:26.04 容器 + clang-21/libc++-21
+#     （ubuntu 的 GCC 13/14 不支持 import std；26.04 的 g++-16 快照会 ICE；本机开发的
+#     GCC 16 能编但不是 CI 可选项），Windows=MSVC + choco ninja，macOS=brew llvm + libc++
+#     + 手写 libc++.modules.json。
+#   * 发行产物：Linux → tar.gz + deb + rpm，Windows → zip，macOS → tar.gz。
+#     包里是 ectave + assets/（assets 由 CMake POST_BUILD 铺好，含 EUI 默认资源与本项目
+#     字体）；不含内置 Octave 引擎（见 packaging/ci-package.sh 顶部说明）。
+#
+# 已知风险：
+#   * ubuntu:26.04 是滚动预发布容器，clang-21/libc++-21 包名若随发布调整需同步改。
+#   * `import std` 依赖 pip 固定的 cmake==4.4.2（cmake/CxxImportStdGate.cmake 的 UUID 表
+#     覆盖 3.30–4.4）；升级 CMake 前先查 gate 文件是否已支持新版本。
+#   * Windows / macOS 由 CI 验证到「编译、测试、打包成功」，运行期未在真机跑过。
+#
+# NOTE: 本地开发在 Linux。不打 tag 时也可以手动触发（workflow_dispatch）：只构建并上传
+# artifact，不建 Release。
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EUI_NEO_REPO: 'https://github.com/sudoevolve/EUI-NEO.git'
+  # 钉住的 EUI 提交（third_party/eui-neo 在 .gitignore 里，CI 必须自行 clone）。
+  # 升级步骤：本地 git -C third_party/eui-neo pull 到想用的提交，跑通构建与冒烟，
+  # 再把该 SHA 写到这里。
+  EUI_NEO_COMMIT: '41e452d6c3e6fdf2b81efa30bc17df6ba6ea4fc1'
+
+jobs:
+  # ------------------------------------------------------------------ Linux
+  # 工具链照搬 Clash-Flux 实证配方：ubuntu:26.04 容器 + clang-21/libc++-21。
+  # 为什么不是 GCC：CMake 的 GNU import-std 发现要 4.0+ 且依赖 GCC ≥15 的
+  # libstdc++.modules.json；apitab 实测 GCC 15 对 vendored 模块包装器报
+  # "exposes TU-local entity"（GCC 16 才放宽，而 26.04 的 g++-16 快照会 ICE），
+  # clang+libc++ 全链最稳。本机开发用 GCC 16（见 README），CI 用这条。
+  build-linux:
+    name: build-linux-x86_64
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install container baseline
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Fetch EUI-NEO source (pinned)
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$EUI_NEO_REPO" third_party/eui-neo
+          git -C third_party/eui-neo checkout "$EUI_NEO_COMMIT"
+
+      - name: Install dependencies
+        run: |
+          apt-get install -y --no-install-recommends \
+            clang-21 libc++-21-dev g++ ninja-build pkg-config file gzip \
+            dpkg-dev fakeroot rpm \
+            python3 python3-pip patchelf \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols \
+            libgl1-mesa-dev libcurl4-openssl-dev
+          # 26.04 的 apt cmake 是 3.31（GNU import-std 发现不行），固定 pip 4.4.2
+          python3 -m pip install --break-system-packages -q cmake==4.4.2
+          cmake --version | head -1
+          # Debian 打包的 libc++.modules.json 相对路径坏指 /lib/share/...，
+          # 按 /usr/lib/llvm-21 的真实布局改写为绝对路径
+          python3 -c "
+          import json
+          p = '/usr/lib/x86_64-linux-gnu/libc++.modules.json'
+          d = json.load(open(p))
+          for m in d['modules']:
+              m['source-path'] = '/usr/lib/llvm-21/share/libc++/v1/' + m['source-path'].split('/')[-1]
+              m['local-arguments']['system-include-directories'] = ['/usr/lib/llvm-21/share/libc++/v1']
+          json.dump(d, open(p, 'w'), indent=1)"
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 \
+            -DCMAKE_CXX_FLAGS='-stdlib=libc++' \
+            -DCMAKE_EXE_LINKER_FLAGS='-stdlib=libc++' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-stdlib=libc++'
+          # 不关 Wayland：glfw 两个后端都编。开发机是 KDE Wayland 会话，实测
+          # glfw 走的是原生 Wayland（/memfd:wayland-cursor + renderD128），关掉
+          # 会强制回落 Xwayland。不装 libdecor-0-dev 是刻意的——装上 glfw 就会链
+          # 它，给发行包平白加一个运行时依赖；KDE/X11 用 xdg-decoration 就够。
+
+      - name: Build release
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Stage runtime bundle
+        run: |
+          set -euo pipefail
+          # exe + assets/ 一起进 dist-src：assets 是 CMake POST_BUILD 铺的
+          # （EUI 默认资源 + 本项目字体），发行包里必须原样带上。
+          test -x build/ectave
+          test -d build/assets
+          mkdir -p dist-src
+          cp build/ectave dist-src/ectave
+          cp -a build/assets dist-src/assets
+          chmod +x dist-src/ectave
+          # clang+libc++ 工具链：libc++/libc++abi/libunwind 多数发行版不预装，随包带出
+          mkdir -p dist-src/lib
+          for lib in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
+            p="$(find /usr/lib -name "$lib" -print -quit 2>/dev/null || true)"
+            if [ -n "$p" ]; then cp -L "$p" "dist-src/lib/$lib"; fi
+          done
+          patchelf --set-rpath '$ORIGIN/lib' dist-src/ectave
+          file dist-src/ectave
+          ls -la dist-src dist-src/lib
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          bash packaging/ci-package.sh linux x86_64 dist-src
+          ls -lh dist
+
+      - name: Package deb and rpm
+        run: |
+          set -euo pipefail
+          mkdir -p dist-pkg
+          cpack --config build/CPackConfig.cmake -G DEB -B dist-pkg
+          cpack --config build/CPackConfig.cmake -G RPM -B dist-pkg
+          deb="$(find dist-pkg -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm="$(find dist-pkg -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          test -n "$deb" && test -n "$rpm"
+          version="$(sed -nE 's/^project\(ectave VERSION ([^ )]+).*/\1/p' CMakeLists.txt | head -1)"
+          cp "$deb" "dist/ectave-v${version}-linux-x86_64.deb"
+          cp "$rpm" "dist/ectave-v${version}-linux-x86_64.rpm"
+          ls -lh dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-linux-x64
+          path: dist/ectave-v*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- Windows
+  # MSVC + Ninja（choco）。静态 CRT（根 CMakeLists 里 CMAKE_MSVC_RUNTIME_LIBRARY=
+  # MultiThreaded），所以包里不用带 vcruntime140*.dll。
+  build-windows:
+    name: build-win64
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Fetch EUI-NEO source (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$EUI_NEO_REPO" third_party/eui-neo
+          git -C third_party/eui-neo checkout "$EUI_NEO_COMMIT"
+
+      - name: Ensure CMake >= 4.4 and Ninja
+        shell: pwsh
+        run: |
+          # import std 的 experimental UUID 门控要求 CMake >= 4.4。
+          python -m pip install --quiet "cmake==4.4.2"
+          cmake --version | Select-Object -First 1
+          choco install ninja -y --no-progress
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build release
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Stage runtime bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path build/ectave.exe -PathType Leaf)) { throw 'build/ectave.exe not found' }
+          if (-not (Test-Path build/assets -PathType Container)) { throw 'build/assets not found' }
+          New-Item -ItemType Directory -Force dist-src | Out-Null
+          Copy-Item build/ectave.exe dist-src\ectave.exe
+          Copy-Item -Recurse build/assets dist-src\assets
+          Get-ChildItem dist-src
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          & "packaging/ci-package.ps1" -RuntimeDir "dist-src"
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-win64
+          path: dist/ectave-v*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------ macOS
+  # 工具链沿用 Clash-Flux 实证：整链 brew LLVM clang/libc++（EUI 在 macOS 上把
+  # core/platform/*_bridge.c 按 Objective-C 编译，AppleClang 也不被 CMake 的 C++20
+  # 模块扫描支持）。brew llvm 不带 libc++.modules.json，按上游 schema 生成一份。
+  build-macos:
+    name: build-macos-arm64
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Fetch EUI-NEO source (pinned)
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$EUI_NEO_REPO" third_party/eui-neo
+          git -C third_party/eui-neo checkout "$EUI_NEO_COMMIT"
+
+      - name: Install dependencies (brew llvm)
+        run: |
+          brew install llvm ninja
+          llvm_prefix="$(brew --prefix llvm)"
+          mod_dir="$llvm_prefix/share/libc++/v1"
+          # brew llvm 只装模块源不带 libc++.modules.json（formula 未开
+          # LIBCXX_ENABLE_STD_MODULES）——按上游 schema 生成一份，写进 brew
+          # 的 lib/ 使 -print-file-name 发现路径命中。
+          for f in std.cppm std.compat.cppm; do
+            test -f "$mod_dir/$f" || { echo "missing $mod_dir/$f (brew llvm layout changed?)" >&2; exit 1; }
+          done
+          python3 - "$mod_dir" "$llvm_prefix/lib/libc++.modules.json" <<'PY'
+          import json, sys
+          mod_dir, out = sys.argv[1], sys.argv[2]
+          mod = lambda name: {"logical-name": name, "source-path": mod_dir + "/" + name + ".cppm", "is-std-library": True, "local-arguments": {"system-include-directories": [mod_dir]}}
+          json.dump({"version": 1, "revision": 1, "modules": [mod("std"), mod("std.compat")]}, open(out, "w"), indent=1)
+          PY
+          echo "LLVM_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
+          cmake --version
+          ninja --version
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          # 要点（Clash-Flux 实证）：OBJC 编译器必须显式指定 brew clang，否则 CMake
+          # 默认拿 xcrun 的 AppleClang 混回两套 libc++；链接行按 brew llvm caveats
+          # 配方；_LIBCPP_DISABLE_AVAILABILITY 关闭针对系统 dylib 的假可用性标注；
+          # CMAKE_CXX_STDLIB_MODULES_JSON 显式注入上一步生成的元数据。
+          # 部署目标 14.0（EUI 的框架层已用 macOS 14 API）。
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_OBJC_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_FLAGS='-stdlib=libc++ -D_LIBCPP_DISABLE_AVAILABILITY' \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_CXX_STDLIB_MODULES_JSON="$LLVM_PREFIX/lib/libc++.modules.json" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+
+      - name: Build release
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Stage runtime bundle and package
+        run: |
+          set -euo pipefail
+          test -x build/ectave
+          test -d build/assets
+          mkdir -p dist-src
+          cp build/ectave dist-src/ectave
+          cp -a build/assets dist-src/assets
+          chmod +x dist-src/ectave
+          bash packaging/ci-package.sh macos arm64 dist-src
+          ls -lh dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-macos-arm64
+          path: dist/ectave-v*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- release
+  # 仅 tag push（v*）触发。三个平台 job 全部成功后才下载产物并发布，发布前再检查
+  # 产物存在，禁止创建空 Release。
+  release:
+    name: release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-macos.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          for pattern in 'ectave-v*-linux-x86_64.tar.gz' 'ectave-v*-linux-x86_64.deb' \
+                         'ectave-v*-linux-x86_64.rpm' 'ectave-v*-win64.zip' \
+                         'ectave-v*-macos-arm64.tar.gz'; do
+            # shellcheck disable=SC2086
+            compgen -G "dist/$pattern" > /dev/null || { echo "missing artifact: $pattern" >&2; exit 1; }
+          done
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ectave ${{ github.ref_name }}
+          # draft：tag 推送后先建草稿，人工过一眼产物再点发布。
+          draft: true
+          body: |
+            ## ectave ${{ github.ref_name }}
+
+            EUI-NEO 套壳 GNU Octave CLI 的桌面工作台。Linux 提供免安装 tar.gz 与
+            .deb/.rpm，macOS / Windows 是免安装压缩包；Linux 的 tar.gz 解压后
+            `./run.sh` 启动，其余直接运行目录里的可执行文件。`assets/` 是随包字体，
+            请**在解压出的目录里启动**（程序按相对路径找字体，找不到时也会退回
+            「可执行文件旁边的 assets/」，所以两者都行）。
+
+            | 平台 | 包 | 启动 |
+            | --- | --- | --- |
+            | Linux x86_64 | `ectave-v*-linux-x86_64.tar.gz` | `./run.sh` |
+            | Linux x86_64 | `.deb` / `.rpm` | 装完直接 `ectave`（菜单里也能找到） |
+            | macOS Apple Silicon | `ectave-v*-macos-arm64.tar.gz` | `./ectave` |
+            | Windows x64 | `ectave-v*-win64.zip` | `ectave.exe` |
+
+            **需要自备 Octave 解释器**：本包不含 Octave，启动时按
+            `engines/octave/`（内置引擎）→ `PATH` 上的 `octave-cli` → `octave`
+            的顺序查找。装上 Octave 即可：
+
+            - Windows：<https://octave.org/download>（安装时勾选 Add to PATH）
+            - macOS：`brew install octave`
+            - Linux：`sudo dnf install octave` / `sudo apt install octave`
+
+            想做成自包含（不依赖系统 Octave）：在已装 Octave 的 Linux 机器上从
+            源码跑 `sh scripts/build_engines.sh` 生成 `engines/octave/`（约
+            250MB），放到程序同级目录即可——引擎会被优先使用。
+
+            **构建体系**：本版本起不再使用 mcpp，改为 CMake + C++23 模块，UI 直接
+            消费 EUI-NEO 上游 `dev` 分支源码（构建时钉住的提交见仓库 workflow）。
+            Linux 包不再需要旧版那层 `ld.so` 包装。
+
+            **已知边界**：`plot()` 不开窗口（引擎跑在 `--no-window-system` 下，
+            需要图时用 `print('/tmp/f.png','-dpng')`）；中断靠往终端写 Ctrl+C
+            实现，极端情况用「重启」清会话；内置引擎树是 Linux 打包脚本的产物，
+            Windows/macOS 请用系统 Octave。
+          files: dist/*

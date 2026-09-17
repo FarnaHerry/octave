@@ -1,8 +1,21 @@
-target/
-.mcpp/
+# ---- 构建产物 ----
+build/
+build-*/
+.cache/
 compile_commands.json
-engines/
-octave-workspace
 dist/
+
+# ---- 内置 Octave 引擎树（scripts/build_engines.sh 生成，约 250MB）----
+engines/
+
+# ---- 依赖源码 checkout ----
+# CI 里各自 clone 并钉 commit（见 .github/workflows/build.yml 的 EUI_NEO_COMMIT），
+# 目录内容不入库。指引见 third_party/README.md。
+third_party/eui-neo/
+
+# ---- 发行包 ----
 ectave-v*.tar.gz
 ectave-v*.zip
+
+# ---- 运行时杂物 ----
+octave-workspace

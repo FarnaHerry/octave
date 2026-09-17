@@ -1,31 +1,40 @@
 #!/usr/bin/env bash
-# ci-package.sh — GitHub Actions 专用打包脚本（**不编译**）。
+# ci-package.sh — 组装发行包（**不编译**）。
 #
-# build job 已经把编好的 ectave 作为 artifact 传进来，本脚本只把
-# 「exe + assets + 使用说明」组装成发行包：
-#   * 不遍历易错的 target/<hash>/ 多目录；
-#   * 不打内置 Octave 引擎——engines/octave 由使用者在自己机器上用
-#     scripts/build_engines.sh 生成（ldd 闭包 + OCTAVE_HOME 资源树，约 250MB），
-#     CI 上没有 octave，也不该把 250MB 塞进每个 artifact。发行包因此走引擎查找
-#     顺序的第二档：「PATH 上的 octave」。本地手动打包时若 engines/octave 已存在，
-#     会自动一并带上。
+# 输入是 build job 传来的「运行时目录」：ectave + assets/（assets 里已经有 EUI 的默认
+# 资源与本项目字体 —— 那是 CMake POST_BUILD 铺好的）。本脚本只负责套上使用说明、
+# 可选的启动脚本与内置引擎，压成 ectave-v<版本>-<os>-<arch>.tar.gz。
 #
-# 用法：bash packaging/ci-package.sh <linux|macos> <x86_64|arm64> <exe路径>
+# 不打内置 Octave 引擎：engines/octave 要由使用者在**装了 octave 的 Linux 机器**上跑
+# scripts/build_engines.sh 生成（ldd 依赖闭包 + OCTAVE_HOME 资源树，约 250MB），CI 上
+# 没有 octave，也不该把 250MB 塞进每个 artifact。发行包因此走引擎查找顺序的第二档
+# ——「PATH 上的 octave」。本地手动打包时若 engines/octave 已存在，会自动一并带上。
+#
+# 用法：bash packaging/ci-package.sh <linux|macos> <x86_64|arm64> <运行时目录>
 
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-os="${1:?usage: ci-package.sh <linux|macos> <arch> <exe>}"
-arch="${2:?usage: ci-package.sh <os> <arch> <exe>}"
-exe="${3:?usage: ci-package.sh <os> <arch> <exe>}"
-version="$(grep -m1 '^version' "$root/mcpp.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+os="${1:?usage: ci-package.sh <linux|macos> <arch> <runtime-dir>}"
+arch="${2:?usage: ci-package.sh <os> <arch> <runtime-dir>}"
+runtime_dir="${3:?usage: ci-package.sh <os> <arch> <runtime-dir>}"
+
+# 版本号唯一来源是 CMakeLists 的 project(... VERSION ...)（旧版读 mcpp.toml）。
+version="$(sed -nE 's/^project\(ectave VERSION ([^ )]+).*/\1/p' "$root/CMakeLists.txt" | head -1)"
+if [ -z "$version" ]; then
+    echo "无法从 $root/CMakeLists.txt 读出版本号" >&2
+    exit 1
+fi
 
 dist="$root/dist"
 rm -rf "$dist"
 mkdir -p "$dist"
 
-cp "$exe" "$dist/ectave"
+[ -d "$runtime_dir" ] || { echo "运行时目录不存在: $runtime_dir" >&2; exit 1; }
+[ -f "$runtime_dir/ectave" ] || { echo "运行时目录里没有 ectave: $runtime_dir" >&2; exit 1; }
+[ -d "$runtime_dir/assets" ] || { echo "运行时目录里没有 assets/: $runtime_dir" >&2; exit 1; }
+
+cp -a "$runtime_dir/." "$dist/"
 chmod +x "$dist/ectave"
-cp -r "$root/assets" "$dist/assets"
 cp "$root/packaging/dist-README.md" "$dist/README.md"
 
 # 本地手动打包时若已生成内置引擎，一并带上（CI 里不存在，自动跳过）。
@@ -36,22 +45,17 @@ if [ -x "$root/engines/octave/bin/octave-cli" ]; then
 fi
 
 if [ "$os" = "linux" ]; then
-    # 经系统 ld.so 加载：mcpp 自带的 glibc 与发行版图形栈（Mesa/GLX）的 GLIBC
-    # 版本可能对不上，图形栈走系统那份最稳。
+    # 只是 cd 到包目录再起：EUI 找字体是「cwd 相对路径 → <可执行文件目录>/assets」的
+    # 顺序，cd 过去命中第一档（不 cd 也能命中第二档，cd 只是更贴近直觉）。
     #
-    # `--inhibit-rpath ''` 不能省：产物带的是 **RPATH**（不是 RUNPATH），优先级
-    # 高于 --library-path，里面是**构建机**的 mcpp xpkg 绝对路径（含私有 glibc
-    # 2.44）与 $ORIGIN。在装过 mcpp 的机器上（构建机自己就是）它会抢先命中那份
-    # 私有 glibc，跟系统库混用直接炸：
-    #   symbol lookup error: .../xim-x-glibc/2.44/lib64/libc.so.6:
-    #   undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE
-    # 清空 RPATH 后按 --library-path + /etc/ld.so.cache 走系统库（干净机器上
-    # 那些目录本就不存在，行为一致）。
+    # 旧 mcpp 版本这里有一层 /lib64/ld-linux-x86-64.so.2 --inhibit-rpath '' --library-path ...
+    # 包装，用来躲开 mcpp 私有 glibc 与发行版 Mesa/GLX 的版本冲突。改用系统编译器后
+    # 二进制不再带指向构建机的 RPATH，那层包装整个消失了。
     cat > "$dist/run.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-exec /lib64/ld-linux-x86-64.so.2 --inhibit-rpath '' --library-path "/usr/lib64:$PWD" "$PWD/ectave" "$@"
+exec ./ectave "$@"
 EOF
     chmod +x "$dist/run.sh"
 fi
