@@ -204,8 +204,9 @@ inline void syncFromEngine(OctaveEngine& engine) {
         case EventKind::StartFailed:
             appendLine(LineKind::Error,
                        event.failReason == "not-found"
-                           ? "ectave: 未找到 octave 可执行文件 — 先安装：sudo dnf install octave "
-                             "(或 apt install octave)，然后点「重启」"
+                           ? "ectave: 既无内置引擎（engines/octave）也没在 PATH 找到 octave — "
+                             "运行 scripts/build_engines.sh 打包内置，或 sudo dnf install octave，"
+                             "然后点「重启」"
                            : "ectave: Octave 启动失败（" + event.failReason + "）");
             break;
         case EventKind::Exited:

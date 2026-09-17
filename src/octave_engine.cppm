@@ -1,5 +1,9 @@
 // octave_engine.cppm — GNU Octave CLI 子进程封装（ectave 的“壳引擎”）。
 //
+// 引擎查找顺序：内置 engines/octave（OCTAVE_HOME 树，scripts/build_engines.sh
+// 生成；子进程里 setenv OCTAVE_HOME/LD_LIBRARY_PATH/FLEXIBLAS_* 后绝对路径
+// execv）→ PATH octave-cli → PATH octave。ECTAVE_OCTAVE_HOME 可显式指定内置根。
+//
 // 模型：forkpty 在真 PTY 里跑交互式 `octave -q --no-window-system`。
 // 为什么必须是 PTY 而不是管道：管道模式下 octave 进入批处理语义——任何
 // 运行时 error() 或**语法错误**都会直接终止整个解释器（Octave 10 又移除了
@@ -105,7 +109,18 @@ public:
             }
             stop();
         }
-        if (!findOnPath("octave")) {
+        // 引擎优先级：内置 engines/octave（OCTAVE_HOME 树，见
+        // scripts/build_engines.sh）→ PATH 上的 octave-cli → octave。
+        const std::string home = findBundledOctaveHome();
+        std::string program;
+        if (!home.empty()) {
+            program = home + "/bin/octave-cli";
+        } else if (findOnPath("octave-cli")) {
+            program = "octave-cli";
+        } else if (findOnPath("octave")) {
+            program = "octave";
+        }
+        if (program.empty()) {
             state_ = static_cast<int>(EngineState::Failed);
             std::lock_guard<std::mutex> lock(eventsMutex_);
             queue_.push_back({.kind = EventKind::StartFailed, .failReason = "not-found"});
@@ -125,7 +140,33 @@ public:
         if (pid == 0) {
             // 子进程：stdio 已被 forkpty 接到 PTY slave，octave 直接进入
             // 交互模式（错误终止、Ctrl+C 恢复——与真人终端一致）。
-            execlp("octave", "octave", "-q", "--no-window-system", static_cast<char*>(nullptr));
+            char* const args[] = {const_cast<char*>("octave-cli"), const_cast<char*>("-q"),
+                                  const_cast<char*>("--no-window-system"), nullptr};
+            if (!home.empty()) {
+                // 内置引擎：先摆好环境再绝对路径 execv。fork 后子进程是单
+                // 线程、马上就要 exec，setenv 安全；字符串须活到 execv 为止。
+                ::setenv("OCTAVE_HOME", home.c_str(), 1);
+                std::string ldValue = home + "/lib";
+                if (const char* old = ::getenv("LD_LIBRARY_PATH"); old != nullptr && *old != '\0') {
+                    ldValue += ':';
+                    ldValue += old;
+                }
+                ::setenv("LD_LIBRARY_PATH", ldValue.c_str(), 1);
+                // flexiblas 的 provider/后端是运行时 dlopen，不在 ldd 闭包里，
+                // 打包时单独收集——只在目录存在时才设，别把 PATH 模式的机器带偏。
+                std::error_code ec;
+                const std::string flexLib = home + "/lib/flexiblas";
+                if (std::filesystem::is_directory(flexLib, ec)) {
+                    ::setenv("FLEXIBLAS_LIBRARY_PATH", flexLib.c_str(), 1);
+                    const std::string flexRc = home + "/etc/flexiblasrc";
+                    if (std::filesystem::exists(flexRc, ec)) {
+                        ::setenv("FLEXIBLAS_CONFIG", flexRc.c_str(), 1);
+                    }
+                }
+                ::execv(program.c_str(), args);
+            } else {
+                ::execvp(program.c_str(), args);
+            }
             _exit(127);
         }
 
@@ -274,6 +315,76 @@ private:
             start = sep + 1;
         }
         return false;
+    }
+
+    // 内置引擎目录（OCTAVE_HOME 树：bin/octave-cli、lib/、share/octave/、
+    // lib64/octave/）。由 scripts/build_engines.sh 生成。开发期 exe 在
+    // target/<triple>/<cfg>/bin/ 下，engines/ 在项目根——从 exe 目录逐级向上找；
+    // ECTAVE_OCTAVE_HOME 环境变量可显式指定（打包发布时引擎放 exe 同级）。
+    static std::string findBundledOctaveHome() {
+        const auto usable = [](const std::filesystem::path& p) {
+            std::error_code ec;
+            const auto st = std::filesystem::status(p, ec);
+            return !ec && std::filesystem::is_regular_file(st) &&
+                   (st.permissions() & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
+        };
+        std::vector<std::filesystem::path> roots;
+        if (const char* env = ::getenv("ECTAVE_OCTAVE_HOME"); env != nullptr && *env != '\0') {
+            roots.emplace_back(env);
+        }
+        // 从 dir 起逐级向上收集 <dir>/engines/octave 候选（mcpp 产物在
+        // target/<triple>/<fp>/bin/ —— 到项目根要上溯 4 级，多留几级余量）。
+        const auto addUpwards = [&roots](std::filesystem::path dir) {
+            for (int up = 0; up <= 6; ++up) {
+                roots.push_back(dir / "engines" / "octave");
+                const auto parent = dir.parent_path();
+                if (parent.empty() || parent == dir) {
+                    break;
+                }
+                dir = parent;
+            }
+        };
+        // 注意：run.sh 经系统 ld.so 显式加载（mcpp 私有 glibc 兼容问题），
+        // 此时 /proc/self/exe 是 ld.so 而不是 ectave——所以还要看
+        // /proc/self/cmdline 的第 0 个参数，最后兜底 cwd。
+        auto addFromPathArg = [&](const std::string& arg0) {
+            if (arg0.empty()) {
+                return;
+            }
+            std::error_code ec;
+            std::filesystem::path p = std::filesystem::weakly_canonical(arg0, ec);
+            if (ec || p.empty()) {
+                p = std::filesystem::path(arg0);
+            }
+            addUpwards(p.parent_path());
+        };
+        {
+            std::ifstream cmd("/proc/self/cmdline", std::ios::binary);
+            std::string arg0;
+            std::getline(cmd, arg0, '\0');
+            addFromPathArg(arg0);
+        }
+        {
+            char buf[4096];
+            const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = '\0';
+                addFromPathArg(buf);
+            }
+        }
+        {
+            std::error_code ec;
+            const auto cwd = std::filesystem::current_path(ec);
+            if (!ec) {
+                addUpwards(cwd);
+            }
+        }
+        for (const auto& root : roots) {
+            if (usable(root / "bin" / "octave-cli")) {
+                return root.string();
+            }
+        }
+        return {};
     }
 
     std::string makeToken() const {
