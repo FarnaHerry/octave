@@ -8,7 +8,7 @@
 //
 // 模型：POSIX 用 forkpty 造真 PTY，Windows 用 ConPTY（CreatePseudoConsole）——
 // 两者是同一个东西（让 octave 认为自己对着真人终端），都跑交互式
-// `octave -q --no-window-system`。
+// `octave -q --no-window-system`（子进程 TERM=dumb，见文件头「回显处理」）。
 // 为什么必须是 PTY 而不是管道：管道模式下 octave 进入批处理语义——任何
 // 运行时 error() 或**语法错误**都会直接终止整个解释器（Octave 10 又移除了
 // set_error_handler("return")，try/catch 也罩不住 parse error），而 REPL 的
@@ -30,11 +30,25 @@
 // 行，独立成行；readline 回显的是 disp 语句本身（带提示符前缀），不会误配。
 // stdin 有序 ⇒ 哨兵按序返回，天然支持命令排队。
 //
-// 回显处理：PTY/ConPTY 会回显我们写入的每个字符行（提示符 + 命令）。引导时把
-// PS1/PS2 设成固定前缀（kEchoPrefix/kEchoPrefix2），读线程据此丢弃回显行
-// （控制台由 UI 自己打印「» 命令」回显，且着色/排版更好）。残余风险：用户
-// 命令若恰好 disp 出以该前缀开头的行会被一起丢掉——固定前缀足够短小罕见，
-// 换终端显示完整性，值得。
+// 回显处理：PTY/ConPTY 会回显我们写入的每个字符行（提示符 + 命令），读线程整行
+// 丢弃，控制台的回显由 UI 自己打印（「» 命令」，着色/排版更好）。
+//
+// 判定按提示符**形状**而不是固定前缀：octave-cli 的提示符不跟随 PS1——引导里设了
+// `PS1 = "ec> "`，甚至用 `--eval 'PS1=...' --persist` 抢在首个提示符之前设好，
+// octave 打的仍是默认 PS1 `\s:\#>` 展开的 `<程序名>:<命令号>> `（`octave:3> `）。
+// 所以认 isPromptLine() 的形状；kEchoPrefix 保留作兜底，万一某个版本开始认 PS1。
+// 残余风险：用户命令恰好输出形如 `<名字>:<数字>> ` 开头的行会被一起丢掉——
+// 换控制台显示完整，值得。
+//
+// 转义序列靠给子进程设 TERM=dumb 压掉：readline 在真终端下会发 bracketed-paste
+// （ESC[?2004h/l）和光标前移（ESC[C）重绘，TERM=dumb 下这些一概不发（实测与
+// 启动它的终端无关，从桌面菜单和从终端启动行为一致）。
+//
+// **不要改用 `--no-line-editing`**（试过，是错的）：关掉 readline 后 octave 不再
+// 逐行重打提示符，提示符会堆积并粘到输出行行首——实测得到
+// `octave:2> octave:3> octave:4> ECTAVE_BOOT|10.3.0`，于是 ECTAVE_BOOT 与哨兵
+// `%<token>-<seq>%` 都不在行首，被当成回显整行丢掉，启动握手永远完不成（状态卡在
+// 「启动中…」）。readline 的逐行提示符正是哨兵能对齐行首的前提。
 //
 // 线程纪律：
 //   - UI 线程：start()/send()/interrupt()/stop()/restart()/drainEvents()。
@@ -100,17 +114,80 @@ import ectave.utils;
 
 export namespace ectave {
 
-// 交互式提示符前缀（引导里设死，回显行据此丢弃）。echo-on 下 readline 回显
-// 独占「提示符+命令」整行、程序输出行独立干净；若 stty -e 关掉内核 echo，
-// 待输出的提示符会粘进下一条结果行行首、破坏哨兵精确匹配——保持 echo on，
-// 整行丢弃回显即可。
+// 交互式提示符前缀（引导里设死）。echo-on 下回显独占「提示符+命令」整行、程序
+// 输出行独立干净；若 stty -e 关掉内核 echo，待输出的提示符会粘进下一条结果行
+// 行首、破坏哨兵精确匹配——保持 echo on，整行丢弃回显即可。
+//
+// 只作兜底：见下面 isPromptLine()，octave 实际不认这个 PS1。
 inline constexpr std::string_view kEchoPrefix = "ec> ";
 inline constexpr std::string_view kEchoPrefix2 = "ec2> ";
+
+// octave-cli 实际打出的提示符：默认 PS1 `\s:\#>` 的展开，形如 `octave:3> `。
+// 形状 = 标识符 + ':' + 数字 + '>' +（行尾或空格）。行内可能还跟着内核回显的
+// 命令原文（`octave:3> 1+1`），整体丢弃正是我们要的。
+inline bool isPromptLine(std::string_view line) {
+    const auto isIdent = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+    };
+    std::size_t i = 0;
+    while (i < line.size() && isIdent(line[i])) {
+        ++i;
+    }
+    if (i == 0 || i >= line.size() || line[i] != ':') {
+        return false;
+    }
+    ++i;
+    const std::size_t digitsBegin = i;
+    while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+        ++i;
+    }
+    if (i == digitsBegin || i >= line.size() || line[i] != '>') {
+        return false;
+    }
+    ++i;
+    return i == line.size() || line[i] == ' ';
+}
+
+// 哨兵行解析：`%<token>-<seq>%` → seq 文本；形状不符返回 nullopt。
+//
+// 注意是**单个**百分号：send() 拼的是 disp('%<token>-<seq>%')。
+// 这里曾经按 `%%<token>-<seq>%%` 写，两个 off-by-one 叠在一起——长度判定要求
+// `size > head + 2`（单 digit 时恰好相等，形状就不认），就算过了 substr 也多啃
+// 一个字符（"1" 变 ""）。结果是**任何 seq 都匹配不上**：End 事件永不触发，
+// 哨兵行还会当普通输出漏进控制台。
+inline std::optional<std::string> parseSentinel(std::string_view line, std::string_view token) {
+    std::string head = "%";
+    head += token;
+    head += '-';
+    if (!startsWith(line, head) || line.size() <= head.size() + 1 || line.back() != '%') {
+        return std::nullopt;
+    }
+    std::string seqText(line.substr(head.size(), line.size() - head.size() - 1));
+    // seq 一律来自 std::to_string(uint64)，非纯数字就不是哨兵——放行给普通输出，
+    // 免得形状相近的用户输出被静默吃掉。
+    if (seqText.find_first_not_of("0123456789") != std::string::npos) {
+        return std::nullopt;
+    }
+    return seqText;
+}
 
 // 伪终端尺寸：给 octave 自己的矩阵排版/换行留足列数，哨兵行（短）绝不
 // 会被终端宽度劈成两行。
 inline constexpr int kTermRows = 200;
 inline constexpr int kTermCols = 500;
+
+// 引导载荷：关分页 + 固定 PS1/PS2 + 上报版本。由读线程在 octave 就绪后发送
+// （理由见 start() 里 bootPending_ 那段）。
+inline constexpr std::string_view kBootPayload =
+    "more off;\n"
+    "PS1 = \"ec> \";\n"
+    "PS2 = \"ec2> \";\n"
+    "printf(\"ECTAVE_BOOT|%s\\n\", OCTAVE_VERSION());";
+
+// 等不到第一个提示符时的兜底发送延迟。异常构建/ConPTY 行为不同也不至于让引擎
+// 卡在 Starting——最坏情况就退化成「启动时立刻发」的旧行为，只是晚一点。
+inline constexpr auto kBootFallbackDelay = std::chrono::milliseconds(1500);
 
 enum class EngineState { Stopped, Starting, Ready, Failed };
 enum class SeqPurpose { Bootstrap, Command, Workspace };
@@ -209,15 +286,31 @@ public:
         state_ = static_cast<int>(EngineState::Starting);
         token_ = makeToken();
 
-        // 引导：关分页（tty 下 "-- more --" 会挂起输入流）、固定 PS1/PS2
-        // （回显按前缀丢弃）、上报版本。
-        send("more off;\n"
-             "PS1 = \"ec> \";\n"
-             "PS2 = \"ec2> \";\n"
-             "printf(\"ECTAVE_BOOT|%s\\n\", OCTAVE_VERSION());",
-             SeqPurpose::Bootstrap);
-
+        // 引导内容：关分页（tty 下 "-- more --" 会挂起输入流）、固定 PS1/PS2、
+        // 上报版本。**不在这里直接发**——见 bootPending_。
+        //
+        // 读线程起来之后再由它触发发送：octave 打出第一个提示符（readline 接管）
+        // 之前的字节会被 tty 行规程直接回显，那时回显行不带提示符前缀、丢不掉，
+        // 会原样漏进控制台。等提示符到了再发，引导的每一步回显都带前缀、整行丢弃。
+        bootPending_ = true;
+        bootStarted_ = std::chrono::steady_clock::now();
         reader_ = std::thread([this] { readLoop(); });
+    }
+
+    // 引导的发送时机。promptSeen = 刚收到一个提示符行（octave 已就绪，readline
+    // 接管了回显）；否则是轮询超时点，只在等过 kBootFallbackDelay 后才兜底发送。
+    // 只发一次：bootPending_ 的 exchange 保证。
+    void maybeSendBootstrap(bool promptSeen) {
+        if (!bootPending_.load()) {
+            return;
+        }
+        if (!promptSeen &&
+            std::chrono::steady_clock::now() - bootStarted_ < kBootFallbackDelay) {
+            return;
+        }
+        if (bootPending_.exchange(false)) {
+            send(std::string(kBootPayload), SeqPurpose::Bootstrap);
+        }
     }
 
     // 发送一段命令（可多行），末尾自动追加本命令的哨行。返回 false = 进程未运行。
@@ -490,8 +583,12 @@ private:
     // 子进程侧：内置引擎先摆好环境再绝对路径 execv。fork 后子进程是单线程、
     // 马上就要 exec，setenv 安全；字符串须活到 execv 为止。
     static void execChild(const std::string& home, const std::string& program) {
+        // TERM=dumb：压掉 readline 的转义序列，且让子进程输出不随启动方式变化
+        // （桌面菜单启动时没有 TERM，从终端启动时有，不设会得到两种行为）。
+        // 别在这里加 --no-line-editing：见文件头「回显处理」，它会毁掉哨兵对齐。
         char* const args[] = {const_cast<char*>("octave-cli"), const_cast<char*>("-q"),
                               const_cast<char*>("--no-window-system"), nullptr};
+        ::setenv("TERM", "dumb", 1);
         if (home.empty()) {
             ::execvp(program.c_str(), args);
             return;
@@ -563,6 +660,7 @@ private:
                 break;
             }
             if (ready == 0) {
+                maybeSendBootstrap(false);  // 超时兜底：等不到提示符也得把引擎拉起来
                 continue;
             }
             const ssize_t n = ::read(masterFd_, buf, sizeof(buf));
@@ -750,7 +848,8 @@ private:
                 break;
             }
             if (!progressed) {
-                ::Sleep(50);  // 等价 POSIX 侧的 poll(100ms) 等待
+                maybeSendBootstrap(false);  // 超时兜底，同 POSIX 侧
+                ::Sleep(50);                // 等价 POSIX 侧的 poll(100ms) 等待
             }
         }
         if (childGone) {
@@ -774,7 +873,14 @@ private:
             if (nl == std::string::npos) {
                 break;
             }
-            const std::string_view line(leftover.data(), nl);
+            std::string_view line(leftover.data(), nl);
+            // PTY/ConPTY 发的是 CRLF，尾部 '\r' 必须剥掉：留着它哨兵行的
+            // `line.back() == '%'` 判定就永假（哨兵因此从未匹配上过，End 事件不触发、
+            // 哨兵行还会漏进控制台），ECTAVE_BOOT 的版本号与 ECTVAR 的 dims 里也会
+            // 混进一个 '\r'。
+            if (!line.empty() && line.back() == '\r') {
+                line.remove_suffix(1);
+            }
             handleLine(line);
             leftover.erase(0, nl + 1);
         }
@@ -783,6 +889,9 @@ private:
     // 读线程收尾（两平台共用）：残余半行、Exited 事件、状态落定。
     void endReadLoop(std::string leftover) {
         if (!leftover.empty()) {
+            if (leftover.back() == '\r') {
+                leftover.pop_back();
+            }
             handleLine(leftover);
         }
         {
@@ -804,31 +913,29 @@ private:
     void handleLine(std::string_view lineView) {
         // 内核 echo 把「提示符+命令」原样打回，整行丢弃——控制台回显由 UI
         // 自己渲染（见文件头「回显处理」）。必须在锁外做，纯字符串判断。
-        if (startsWith(lineView, kEchoPrefix) || startsWith(lineView, kEchoPrefix2)) {
+        if (isPromptLine(lineView) || startsWith(lineView, kEchoPrefix) ||
+            startsWith(lineView, kEchoPrefix2)) {
+            // 这里还没上锁，可以从读线程发引导（send 自己会拿 eventsMutex_/writeMutex_）。
+            maybeSendBootstrap(true);
             return;
         }
         std::string line(lineView);
         std::lock_guard<std::mutex> lock(eventsMutex_);
-        // 哨兵行：%%<token>-<seq>%%，整行精确匹配才算（用户 echo 输出带不进 %%）。
-        const std::string sentinelHead = "%" + token_ + "-";
-        if (startsWith(line, sentinelHead) && line.size() > sentinelHead.size() + 2 && line.back() == '%') {
-            const std::string seqText = line.substr(sentinelHead.size(), line.size() - sentinelHead.size() - 2);
+        // 哨兵行：%<token>-<seq>%（见 parseSentinel），整行精确匹配才算。
+        if (const auto seqText = parseSentinel(line, token_)) {
             // 只认队首 seq（哨兵按 stdin 写入顺序返回）；不匹配的行当作普通输出。
-            if (!pendingSeq_.empty()) {
-                const std::string head = std::to_string(pendingSeq_.front());
-                if (seqText == head) {
-                    const std::uint64_t seq = pendingSeq_.front();
-                    pendingSeq_.pop_front();
-                    SeqPurpose purpose = SeqPurpose::Command;
-                    if (const auto it = purposes_.find(seq); it != purposes_.end()) {
-                        purpose = it->second;
-                        purposes_.erase(it);
-                    }
-                    busy_ = !pendingSeq_.empty();
-                    queue_.push_back({.kind = EventKind::End, .purpose = purpose});
-                    core::platform::requestUiUpdate();
-                    return;
+            if (!pendingSeq_.empty() && *seqText == std::to_string(pendingSeq_.front())) {
+                const std::uint64_t seq = pendingSeq_.front();
+                pendingSeq_.pop_front();
+                SeqPurpose purpose = SeqPurpose::Command;
+                if (const auto it = purposes_.find(seq); it != purposes_.end()) {
+                    purpose = it->second;
+                    purposes_.erase(it);
                 }
+                busy_ = !pendingSeq_.empty();
+                queue_.push_back({.kind = EventKind::End, .purpose = purpose});
+                core::platform::requestUiUpdate();
+                return;
             }
         } else if (startsWith(line, "ECTVAR|")) {
             // ECTVAR|name|class|dims（三段，dims 不含 '|'）
@@ -883,6 +990,10 @@ private:
     std::mutex writeMutex_;
     std::mutex eventsMutex_;
     std::deque<EngineEvent> queue_;
+    // 引导还没发出去（start() 置位，读线程在 octave 就绪后发送）。
+    std::atomic<bool> bootPending_{false};
+    std::chrono::steady_clock::time_point bootStarted_{};
+
     std::deque<std::uint64_t> pendingSeq_;
     std::unordered_map<std::uint64_t, SeqPurpose> purposes_;
     std::uint64_t seq_ = 0;  // eventsMutex_ 保护
