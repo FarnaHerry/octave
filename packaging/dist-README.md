@@ -1,4 +1,6 @@
-# ectave v0.1.0 — EUI-NEO 套壳 GNU Octave 的桌面工作台
+# ectave — EUI-NEO 套壳 GNU Octave 的桌面工作台
+
+（版本号见压缩包文件名。）
 
 把 `octave` CLI 跑在真终端（Linux/macOS 用 PTY，Windows 用 ConPTY）里，套一层
 桌面 UI：按行着色控制台、历史、工作区变量面板、脚本页。

@@ -55,6 +55,15 @@ module;
 #ifndef NOMINMAX
 #define NOMINMAX  // 否则 windows.h 的 min/max 宏会砸到 std::min/std::max
 #endif
+// STARTUPINFOEX / InitializeProcThreadAttributeList / PeekNamedPipe 的声明要有
+// Vista+ 的头可见性；不显式定版本时老 SDK 会把它们藏起来（ConPTY 那几个入口
+// 本来就走 GetProcAddress 动态取，但属性表这一套是直接调用的）。
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
 #include <windows.h>
 #else
 #include <unistd.h>

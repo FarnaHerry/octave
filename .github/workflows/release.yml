@@ -110,15 +110,16 @@ jobs:
           set -euo pipefail
           # 只取最新一个 target/<triple>/<hash>/bin，避免遍历易错的多 hash 目录。
           bin="$(ls -dt target/*/*/bin | head -1)"
-          src="$(find "$bin" -maxdepth 1 -name 'ectave*' -type f | head -1)"
-          [ -n "$src" ] || { echo "compiled binary not found in $bin" >&2; exit 1; }
-          mkdir -p dist-src
-          # 保留平台扩展名：Windows 拷贝为 ectave.exe，unix 拷贝为 ectave。
+          # 按平台取精确文件名：bin/ 里还有依赖库（以及 Windows 上的 .pdb 之类），
+          # 用通配符「ectave*」取第一个可能拿到别的文件。
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "$src" dist-src/ectave.exe
+            src="$bin/ectave.exe"
           else
-            cp "$src" dist-src/ectave
+            src="$bin/ectave"
           fi
+          [ -f "$src" ] || { echo "compiled binary not found at $src (dir: $bin)" >&2; ls -la "$bin" >&2; exit 1; }
+          mkdir -p dist-src
+          cp "$src" "dist-src/$(basename "$src")"
           ls -lh dist-src/
 
       - name: Upload compiled exe
